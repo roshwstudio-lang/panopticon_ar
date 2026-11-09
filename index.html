@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>Panopticon AR</title>
+<style>
+  html, body { margin:0; height:100%; background:#000; overflow:hidden; font-family:system-ui,-apple-system,sans-serif; color:#fff; touch-action:manipulation; }
+  #ar { position:fixed; inset:0; }
+  #gate { position:fixed; inset:0; z-index:10; display:flex; flex-direction:column; justify-content:center; align-items:center; background:#000; text-align:center; padding:28px; }
+  #gate h2 { font-weight:500; margin:0 0 12px; }
+  #gate p { opacity:.8; line-height:1.5; max-width:320px; }
+  #gate button { font-size:18px; padding:14px 30px; margin:8px; border-radius:14px; border:0; }
+  #hint { position:fixed; top:max(16px, env(safe-area-inset-top)); width:100%; text-align:center; z-index:5; opacity:.85; font-size:15px; pointer-events:none; transition:opacity .6s; }
+  #card { position:fixed; left:0; right:0; bottom:0; z-index:6; background:rgba(0,0,0,.78); border-top:1px solid #fff4; padding:18px 22px max(22px, env(safe-area-inset-bottom)); transform:translateY(105%); transition:transform .45s ease; max-width:560px; margin:0 auto; border-radius:18px 18px 0 0; }
+  #card.open { transform:translateY(0); }
+  #card .row { display:flex; align-items:center; gap:12px; }
+  #card .sw { width:8px; height:34px; border-radius:2px; }
+  #card h3 { margin:0; font-size:26px; font-weight:500; }
+  #card .sub { opacity:.6; font-size:13px; margin-top:2px; }
+  #card .big { font-size:22px; margin:14px 0 4px; }
+  #card .dim { opacity:.7; font-size:14px; line-height:1.5; }
+  #card .bar { height:9px; border-radius:5px; margin-top:16px; position:relative; }
+  #card .mark { position:absolute; top:-6px; width:0; height:0; border-left:6px solid transparent; border-right:6px solid transparent; border-top:9px solid #fff; transform:translateX(-6px); }
+  #card .lab { display:flex; justify-content:space-between; font-size:11px; opacity:.55; margin-top:6px; }
+  #card .note { font-size:11px; opacity:.5; margin-top:10px; }
+</style>
+</head>
+<body>
+<div id="gate">
+  <h2>Panopticon would like to access</h2>
+  <p>Camera<br><small>Everything stays on your phone. Nothing is recorded or sent anywhere.</small></p>
+  <div><button id="allow">Allow</button><button id="deny">Don't Allow</button></div>
+</div>
+<div id="hint">Point your phone at the plaque</div>
+<div id="card"></div>
+<div id="ar"></div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "mindar-image-three": "https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image-three.prod.js"
+} }
+</script>
+
+<script type="module">
+// ─────────────────────────────────────────────────────────────────────
+//  PANOPTICON AR — the planet of 570 watching eyes, in your hands.
+//
+//  Each Strava session is an eye on a weekly orbit, coloured by how intense
+//  it was (cool blue = easy, red = hardest). Eyes swivel to follow your phone,
+//  are lit by a sweeping light, and blink. TAP an eye: it floats out to meet
+//  you and a card shows that session's data. Tap empty space to send a wave
+//  of blinks.
+//
+//  Tune the placement without editing code by adding to the address:
+//    ?x=0&y=0&z=1.2   where the planet's centre sits relative to the plaque
+//    ?s=2             the planet's radius, in plaque widths
+//    ?n=300           show only the first 300 eyes (older phones)
+//    ?preview         no camera: orbits the planet on screen (test on a laptop)
+// ─────────────────────────────────────────────────────────────────────
+import * as THREE from 'three';
+
+const Q = new URLSearchParams(location.search);
+const PREVIEW = Q.has('preview');
+const num = (k, d) => (Q.has(k) ? parseFloat(Q.get(k)) : d);
+const WORLD_POS = [num('x', 0), num('y', 0), num('z', 1.2)];
+const WS = PREVIEW ? 1 : num('s', 2.0);          // world scale (planet radius, in plaque widths)
+const MAX_EYES = num('n', 9999);
+const STORY = 28;                                // seconds for every eye to appear
+
+const TAU = Math.PI * 2;
+const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const ease = x => x * x * (3 - 2 * x);
+const fr = x => x - Math.floor(x);
+const pmod = (a, b) => ((a % b) + b) % b;
+const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+// colour of effort: 0 = cool blue, 1 = red
+const STOPS = [[0, [45,110,255]], [0.30, [130,195,255]], [0.55, [255,236,215]], [0.78, [255,150,70]], [1, [255,40,40]]];
+function heat(x) {
+  x = clamp(x, 0, 1);
+  for (let i = 0; i < STOPS.length - 1; i++) {
+    const [a, ca] = STOPS[i], [b, cb] = STOPS[i + 1];
+    if (x <= b) { const t = (x - a) / (b - a); return ca.map((v, k) => v + (cb[k] - v) * t); }
+  }
+  return STOPS[4][1];
+}
+const rgbCss = c => `rgb(${c.map(Math.round).join(',')})`;
+
+const gate = document.getElementById('gate'), hint = document.getElementById('hint'), card = document.getElementById('card');
+const previewLink = () => { const u = new URL(location.href); u.searchParams.set('preview', '1'); return u.toString(); };
+const showProblem = msg => {
+  gate.style.display = 'flex';
+  gate.innerHTML = `<h3>${msg}</h3><p>You can still see the work on screen without the camera.</p><div><a href="${previewLink()}" style="color:#fff;font-size:18px">View on screen instead</a></div>`;
+};
+document.getElementById('deny').onclick = () => showProblem('No problem. Nothing was accessed.');
+document.getElementById('allow').onclick = () => {
+  if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) {
+    showProblem('This browser can’t open the camera. Try opening the page in Safari or Chrome.');
+    return;
+  }
+  gate.style.display = 'none';
+  start().catch(err => { console.error(err); showProblem('The camera couldn’t start.'); });
+};
+if (PREVIEW) { gate.style.display = 'none'; hint.textContent = 'Preview mode: tap an eye'; start(); }
+
+async function loadData() {
+  const text = await (await fetch('assets/activities_clean.csv')).text();
+  const [head, ...lines] = text.trim().split('\n');
+  const cols = head.trim().split(',');
+  return lines.map(l => { const v = l.trim().split(','); const o = {}; cols.forEach((c, i) => o[c] = v[i]); return o; }).slice(0, MAX_EYES);
+}
+
+function dateStr(dayFrac, year) {
+  const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+  const ml = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  let doy = Math.floor(dayFrac * (leap ? 366 : 365)), m = 0;
+  while (m < 11 && doy >= ml[m]) { doy -= ml[m]; m++; }
+  return `${doy + 1} ${MONTHS[m]} ${year}`;
+}
+const timeStr = min => { const m = Math.round(min); return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h ${String(m % 60).padStart(2, '0')} min`; };
+const effortWord = x => x < 0.2 ? 'easy' : x < 0.4 ? 'steady' : x < 0.6 ? 'moderate' : x < 0.8 ? 'hard' : 'all out';
+
+async function start() {
+  const rows = await loadData();
+  let renderer, scene, camera, anchorGroup, mindar, found = PREVIEW;
+
+  if (PREVIEW) {
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(innerWidth, innerHeight);
+    document.querySelector('#ar').appendChild(renderer.domElement);
+    scene = new THREE.Scene();
+    camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.05, 100);
+    anchorGroup = new THREE.Group();
+    scene.add(anchorGroup);
+    addEventListener('resize', () => { renderer.setSize(innerWidth, innerHeight); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); });
+  } else {
+    const { MindARThree } = await import('mindar-image-three');
+    mindar = new MindARThree({ container: document.querySelector('#ar'), imageTargetSrc: 'assets/targets.mind', maxTrack: 1 });
+    ({ renderer, scene, camera } = mindar);
+    const anchor = mindar.addAnchor(0);
+    anchorGroup = anchor.group;
+    anchor.onTargetFound = () => { found = true; hint.style.opacity = 0; };
+    anchor.onTargetLost = () => { hint.textContent = 'Point your phone at the plaque'; hint.style.opacity = 0.85; };
+  }
+
+  const world = new THREE.Group();
+  world.position.set(...WORLD_POS);
+  world.scale.setScalar(WS);
+  anchorGroup.add(world);
+
+  // ---- shared textures and geometry ----
+  const loader = new THREE.TextureLoader();
+  const tex = u => { const t = loader.load(u); t.anisotropy = 4; return t; };
+  const tBase = tex('assets/ink_base.png'), tClosed = tex('assets/ink_closed.png'), tIris = tex('assets/ink_iris.png');
+  const gBase = new THREE.PlaneGeometry(1, 670 / 1810);
+  const gIris = new THREE.PlaneGeometry(367 / 1810, 316 / 1810);
+  const gGlint = new THREE.CircleGeometry(0.5, 12);
+  const mk = map => new THREE.MeshBasicMaterial({ map, transparent: true, depthWrite: false, depthTest: false, side: THREE.DoubleSide });
+
+  // ---- one orbit (great circle) per week of training ----
+  const rings = new Map();
+  let tMax = 0;
+  rows.forEach(r => tMax = Math.max(tMax, +r.t));
+  function ringFor(week, year) {
+    if (!rings.has(week)) {
+      const k = rings.size;
+      const y = 1 - 2 * fr(k * 0.6180339887 + 0.1), rr0 = Math.sqrt(Math.max(0, 1 - y * y)), ph = k * 2.39996;
+      const n = new THREE.Vector3(rr0 * Math.cos(ph), y, rr0 * Math.sin(ph));
+      const helper = Math.abs(n.z) > 0.9 ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 0, 1);
+      const e1 = new THREE.Vector3().crossVectors(n, helper).normalize();
+      const e2 = new THREE.Vector3().crossVectors(n, e1);
+      const rr = clamp(0.28 + 0.72 * (year - 2020) / 6, 0.2, 1);
+      const omega = (Math.random() < 0.5 ? -1 : 1) * 0.30 / (0.6 + 0.8 * rr) * (0.7 + 0.6 * Math.random());
+      const line = new THREE.LineLoop(circleGeo(), new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.07, depthWrite: false, depthTest: false }));
+      // orient the unit circle into this ring's plane
+      line.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(e1, e2, n));
+      world.add(line);
+      rings.set(week, { k, n, e1, e2, rr, omega, count: 0, totalMin: 0, line, bt: 1e9 });
+    }
+    return rings.get(week);
+  }
+  function circleGeo() {
+    const pts = [];
+    for (let i = 0; i < 48; i++) pts.push(new THREE.Vector3(Math.cos(TAU * i / 48), Math.sin(TAU * i / 48), 0));
+    return new THREE.BufferGeometry().setFromPoints(pts);
+  }
+
+  // ---- one eye per session ----
+  const eyes = rows.map((r, i) => {
+    const tt = +r.t, minutes = +r.minutes, intensity = +r.intensity;
+    const ring = ringFor(Math.floor(tt * 52.18), +r.year);
+    const sz = clamp((Math.sqrt(minutes) - Math.sqrt(5)) / (Math.sqrt(90) - Math.sqrt(5)), 0, 1);
+    const u = 0.6 * Math.pow(Math.random(), 2) + 0.2 * sz + 0.12 * intensity;
+    const w = (0.018 + 0.30 * u * u) * 1.645;           // eye width, in planet radii
+    const big = w > 0.10;
+    const type = r.type || '';
+    const rep = 1.8 + 1.2 * Math.random();
+    const g = new THREE.Group();
+    g.visible = false;
+    const mBase = mk(tBase), mClosed = mk(tClosed), mIris = [mk(tIris), mk(tIris), mk(tIris)];
+    const base = new THREE.Mesh(gBase, mBase), closed = new THREE.Mesh(gBase, mClosed);
+    const backs = big ? [new THREE.Mesh(gBase, mk(tBase)), new THREE.Mesh(gBase, mk(tBase))] : [];
+    backs.forEach((b, k) => { b.position.z = -0.12 * (k ? 0.45 : 1); g.add(b); });
+    g.add(base, closed);
+    const irises = [];
+    const nIris = big ? 3 : 1;
+    for (let k = 0; k < nIris; k++) { const m = new THREE.Mesh(gIris, mIris[k]); irises.push(m); g.add(m); }
+    const glint = new THREE.Mesh(gGlint, new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, depthWrite: false, depthTest: false }));
+    if (big) g.add(glint);
+    world.add(g);
+    ring.count++; ring.totalMin += minutes;
+    const bt = STORY * (0.55 * i / Math.max(rows.length - 1, 1) + 0.45 * tt / tMax);
+    ring.bt = Math.min(ring.bt, bt);
+    const wobs = { 'Run': [0, .2], 'Ride': [.3, .05], 'Weight Training': [.04, 1 / rep], 'Workout': [.08, .4], 'Walk': [.12, .1], 'Yoga': [.02, .05] };
+    const [wobAmp, wobF] = wobs[type] || (type.startsWith('Football') ? [.10, 1.3] : [.05, .2]);
+    const hr = +r.hr;
+    let blinkInt = hr > 0 ? lerp(3.4, 0.9, clamp((hr - 90) / 85, 0, 1)) : (type === 'Run' ? 1.7 : type === 'Ride' ? 2.4 : type === 'Walk' ? 3.4 : type === 'Yoga' ? 7 : 2.5);
+    blinkInt *= 0.85 + 0.3 * Math.random();
+    if (type === 'Weight Training') blinkInt = rep;
+    return { r, ring, w, big, g, base, closed, backs, irises, glint, mBase, mClosed, mIris, bt, intensity, type,
+             th0: fr(tt * 52.18) * TAU, seed: Math.random() * 100, wobAmp, wobF, rep, blinkInt,
+             blinkOff: Math.random() * blinkInt, forced: -100, gx: 0, gy: 0, sn: new THREE.Vector3(), init: false,
+             glanceCycle: 4 + 5 * Math.random(), glanceLen: 1.2 + 1.4 * Math.random(),
+             px: 0, py: 0, pz: 0, scr: null, dWorld: 1 };
+  });
+
+  // ---- the heart: one giant eye that always faces you, with an orange halo ----
+  const heart = new THREE.Group();
+  const hBase = new THREE.Mesh(gBase, mk(tBase)), hClosed = new THREE.Mesh(gBase, mk(tClosed)), hIris = new THREE.Mesh(gIris, mk(tIris));
+  hClosed.visible = false;
+  hIris.position.z = 0.003;
+  const cv = document.createElement('canvas'); cv.width = cv.height = 128;
+  const cx2 = cv.getContext('2d'), gr = cx2.createRadialGradient(64, 64, 0, 64, 64, 64);
+  gr.addColorStop(0, 'rgba(252,76,2,0.55)'); gr.addColorStop(1, 'rgba(252,76,2,0)');
+  cx2.fillStyle = gr; cx2.fillRect(0, 0, 128, 128);
+  const halo = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ map: new THREE.CanvasTexture(cv), transparent: true, depthWrite: false, depthTest: false }));
+  halo.position.z = -0.01;
+  heart.add(halo, hBase, hClosed, hIris);
+  world.add(heart);
+
+  // ---- dust ----
+  const dustPos = new Float32Array(400 * 3);
+  for (let i = 0; i < 400; i++) {
+    const v = new THREE.Vector3(Math.random() - .5, Math.random() - .5, Math.random() - .5).normalize().multiplyScalar(1.15 + Math.random() * 1.8);
+    dustPos.set([v.x, v.y, v.z], i * 3);
+  }
+  const dustGeo = new THREE.BufferGeometry(); dustGeo.setAttribute('position', new THREE.BufferAttribute(dustPos, 3));
+  const dust = new THREE.Points(dustGeo, new THREE.PointsMaterial({ color: 0xbed2ff, size: 0.018, transparent: true, opacity: 0.55, depthWrite: false }));
+  world.add(dust);
+
+  // ---- threads of gaze converging on a selected eye ----
+  const beamPos = new Float32Array(eyes.length * 6);
+  const beamGeo = new THREE.BufferGeometry(); beamGeo.setAttribute('position', new THREE.BufferAttribute(beamPos, 3)); beamGeo.setDrawRange(0, 0);
+  const beams = new THREE.LineSegments(beamGeo, new THREE.LineBasicMaterial({ color: 0xff9a5a, transparent: true, opacity: 0.12, depthWrite: false, depthTest: false }));
+  beams.frustumCulled = false;
+  world.add(beams);
+
+  // ---- tapping ----
+  let selEye = null, selActive = false, selW = 0, hintGone = false;
+  function showCard(e) {
+    const r = e.r, km = +r.km, minutes = +r.minutes, elev = +r.elev, hr = +r.hr, cal = +r.cal;
+    const speed = km > 0 && minutes > 0 ? km / (minutes / 60) : 0;
+    const col = rgbCss(heat(Math.pow(e.intensity, 0.7)));
+    const grad = Array.from({ length: 11 }, (_, i) => `${rgbCss(heat(Math.pow(i / 10, 0.7)))} ${i * 10}%`).join(',');
+    const lines = [];
+    if (speed > 0 && e.type === 'Run') lines.push(`${(minutes / km).toFixed(1)} min per km`);
+    else if (speed > 0) lines.push(`${speed.toFixed(1)} km/h`);
+    if (elev > 0) lines.push(`${Math.round(elev)} m climbed`);
+    if (hr > 0) lines.push(`average heart rate ${Math.round(hr)} bpm`);
+    if (cal > 0) lines.push(`${Math.round(cal)} calories`);
+    const wk = Math.floor(+r.t * 52.18) + 1;
+    card.innerHTML = `
+      <div class="row"><div class="sw" style="background:${col}"></div><div><h3></h3><div class="sub"></div></div></div>
+      <div class="big"></div><div class="dim"></div>
+      <div class="bar" style="background:linear-gradient(90deg,${grad})"><div class="mark" style="left:${e.intensity * 100}%"></div></div>
+      <div class="lab"><span>calm</span><span class="eff"></span><span>intense</span></div>
+      <div class="note"></div>`;
+    card.querySelector('h3').textContent = e.type;
+    card.querySelector('.sub').textContent = `${dateStr(+r.dayFrac, +r.year)}  ·  week ${wk}`;
+    card.querySelector('.big').textContent = (km > 0 ? `${km.toFixed(1)} km   ` : '') + timeStr(minutes);
+    card.querySelector('.dim').innerHTML = lines.map(l => `<div>${l}</div>`).join('');
+    card.querySelector('.eff').textContent = `effort: ${effortWord(e.intensity)}`;
+    card.querySelector('.note').textContent = (+r.measured > 0.5 ? 'Effort measured from heart rate. ' : 'Effort estimated from pace, calories or nearby sessions. ')
+      + `${e.ring.count} ${e.ring.count === 1 ? 'session' : 'sessions'} that week, ${timeStr(e.ring.totalMin)}.`;
+    card.classList.add('open');
+  }
+  const tap = ev => {
+    if (gate.style.display !== 'none' && !PREVIEW) return;
+    let best = null, bd = 1e9;
+    for (const e of eyes) {
+      if (!e.scr) continue;
+      const dx = e.scr.x - ev.clientX, dy = e.scr.y - ev.clientY;
+      if (dx * dx + dy * dy < e.scr.r * e.scr.r && e.dWorld < bd) { bd = e.dWorld; best = e; }
+    }
+    if (!hintGone) { hintGone = true; hint.style.opacity = 0; }
+    if (best) { selEye = best; selActive = true; showCard(best); }
+    else {
+      if (selActive) { selActive = false; card.classList.remove('open'); }
+      else { const t = clock.elapsedTime - t0; for (const e of eyes) e.forced = t + Math.hypot(e.px, e.py, e.pz) * 0.5; }   // a wave of blinks
+    }
+  };
+  addEventListener('pointerdown', tap);
+
+  // ---- every frame ----
+  const clock = new THREE.Clock();
+  let t0 = -1, waveK = -1, wox = 0, woy = 0, woz = 1;
+  const camW = new THREE.Vector3(), camL = new THREE.Vector3(), tmp = new THREE.Vector3(), M4 = new THREE.Matrix4();
+  const vT = new THREE.Vector3(), vU = new THREE.Vector3(), vN = new THREE.Vector3();
+
+  function frame() {
+    const dt = Math.min(0.05, clock.getDelta()), now = clock.elapsedTime;
+    if (t0 < 0 && found) { t0 = now; if (!PREVIEW) hint.style.opacity = 0; }
+    const t = t0 < 0 ? 0 : now - t0;
+
+    if (PREVIEW) {   // no camera: orbit the planet on screen
+      const a = 0.12 * t, el = 0.35 * Math.sin(0.06 * t), D = 2.7 + 0.3 * Math.sin(0.05 * t);
+      camera.position.set(D * Math.cos(el) * Math.sin(a), D * Math.sin(el), D * Math.cos(el) * Math.cos(a));
+      camera.lookAt(0, 0, 0);
+    }
+    camera.updateMatrixWorld(true);
+    world.updateWorldMatrix(true, false);
+    camera.getWorldPosition(camW);
+    camL.copy(camW); world.worldToLocal(camL);
+
+    const Rs = lerp(0.75, 1, ease(clamp(t / STORY, 0, 1))) * (1 + 0.025 * Math.sin(0.6 * t));
+    const lx = Math.cos(0.15 * t), ly = 0.5, lz = Math.sin(0.15 * t), ll = Math.hypot(lx, ly, lz);
+    const Lx = lx / ll, Ly = ly / ll, Lz = lz / ll;
+
+    // selection easing
+    selW += ((selActive ? 1 : 0) - selW) * (1 - Math.pow(0.9, dt * 60));
+    if (!selActive && selW < 0.01) { selW = 0; selEye = null; }
+
+    // blink wave from the point facing the camera, every 17 s
+    let waveOn = false, waveR = 0;
+    if (t > 8) {
+      const wk = Math.floor((t - 8) / 17), tw = t - 8 - wk * 17;
+      if (wk !== waveK) { waveK = wk; const cl = camL.length() || 1; wox = camL.x / cl + (Math.random() - .5) * .8; woy = camL.y / cl + (Math.random() - .5) * .8; woz = camL.z / cl + (Math.random() - .5) * .8; const wl = Math.hypot(wox, woy, woz); wox /= wl; woy /= wl; woz /= wl; }
+      if (tw < 5) { waveOn = true; waveR = 0.7 * tw; }
+    }
+
+    // the planet's attention: you, or the tapped eye
+    let ax = camL.x, ay = camL.y, az = camL.z;
+    if (selEye) { ax = lerp(camL.x, selEye.px, selW); ay = lerp(camL.y, selEye.py, selW); az = lerp(camL.z, selEye.pz, selW); }
+
+    const fov = camera.fov || 50, focal = (innerHeight / 2) / Math.tan(THREE.MathUtils.degToRad(fov / 2));
+    let nb = 0;
+
+    for (const e of eyes) {
+      const age = t - e.bt;
+      if (age < 0) { e.g.visible = false; e.scr = null; continue; }
+      e.g.visible = true;
+      const ring = e.ring;
+
+      // position on the orbit (surface ripples, speed surges and eases)
+      const ot = t + 4 * Math.sin(0.11 * t);
+      const th = e.th0 + ring.omega * ot + e.wobAmp * Math.sin(TAU * e.wobF * t + e.seed);
+      const cs = Math.cos(th), sn = Math.sin(th);
+      const nx = cs * ring.e1.x + sn * ring.e2.x, ny = cs * ring.e1.y + sn * ring.e2.y, nz = cs * ring.e1.z + sn * ring.e2.z;
+      const tx = -sn * ring.e1.x + cs * ring.e2.x, ty = -sn * ring.e1.y + cs * ring.e2.y, tz = -sn * ring.e1.z + cs * ring.e2.z;
+      const rad = ring.rr * Rs * (1 + 0.045 * Math.sin(3 * th + 1.3 * t + ring.k));
+      e.px = nx * rad; e.py = ny * rad; e.pz = nz * rad;
+      const isSel = (e === selEye);
+      let ppx = e.px, ppy = e.py, ppz = e.pz;
+      if (isSel) { ppx += (camL.x - e.px) * 0.42 * selW; ppy += (camL.y - e.py) * 0.42 * selW; ppz += (camL.z - e.pz) * 0.42 * selW; }
+
+      // distance to the viewer, and which way we face them
+      let dx = camL.x - ppx, dy = camL.y - ppy, dz = camL.z - ppz;
+      const dLoc = Math.hypot(dx, dy, dz) + 1e-6;
+      const fdot0 = (nx * dx + ny * dy + nz * dz) / dLoc;
+
+      // SWIVEL: the whole face turns part-way towards its target
+      let sw = 0.55, tgx = ax, tgy = ay, tgz = az;
+      if (isSel) { sw = 0.5 + 0.45 * selW; tgx = camL.x; tgy = camL.y; tgz = camL.z; }
+      else sw *= clamp((fdot0 + 0.3) / 0.6, 0, 1);
+      let ex = tgx - ppx, ey = tgy - ppy, ez = tgz - ppz;
+      const el = Math.hypot(ex, ey, ez) + 1e-6; ex /= el; ey /= el; ez /= el;
+      let wx = nx * (1 - sw) + ex * sw, wy = ny * (1 - sw) + ey * sw, wz = nz * (1 - sw) + ez * sw;
+      const wl = Math.hypot(wx, wy, wz) + 1e-6; wx /= wl; wy /= wl; wz /= wl;
+      if (!e.init) { e.sn.set(nx, ny, nz); e.init = true; }
+      e.sn.x += (wx - e.sn.x) * 0.12; e.sn.y += (wy - e.sn.y) * 0.12; e.sn.z += (wz - e.sn.z) * 0.12; e.sn.normalize();
+      vN.copy(e.sn);
+      const d1 = tx * vN.x + ty * vN.y + tz * vN.z;
+      vT.set(tx - vN.x * d1, ty - vN.y * d1, tz - vN.z * d1).normalize();
+      vU.crossVectors(vN, vT);
+      M4.makeBasis(vT, vU, vN);
+      e.g.quaternion.setFromRotationMatrix(M4);
+
+      // lit by the sweeping light; eyes turned away go dark
+      const lightK = 0.5 + 0.5 * Math.max(0, vN.x * Lx + vN.y * Ly + vN.z * Lz);
+      const fdot = (vN.x * dx + vN.y * dy + vN.z * dz) / dLoc;
+      const facing = 0.18 + 0.82 * clamp((fdot + 0.15) / 0.6, 0, 1);
+
+      // size: pops in, pulses with the reps, and the tapped eye grows to fill the view
+      const p = clamp(age / 0.9, 0, 1), pop = ease(p) * (1 + 0.25 * Math.sin(p * Math.PI));
+      let scale = e.w * pop * (e.type === 'Weight Training' ? 1 + 0.12 * Math.sin(TAU * t / e.rep + e.seed) : 1);
+      if (isSel) {
+        const projW = scale * WS * focal / (dLoc * WS);
+        scale *= lerp(1, clamp((0.42 * innerWidth) / Math.max(projW, 1), 1, 14), selW);
+      }
+      e.g.position.set(ppx, ppy, ppz);
+      e.g.scale.setScalar(scale);
+      e.dWorld = dLoc * WS;
+
+      // colour: hot = intense; newborns flare hot then cool; the wave heats
+      let waveHit = false, waveWarm = 0;
+      if (waveOn) {
+        const ang = Math.acos(clamp(nx * wox + ny * woy + nz * woz, -1, 1)), dwv = Math.abs(ang - waveR);
+        waveHit = dwv < 0.10 && age > 0.5; waveWarm = clamp(1 - dwv / 0.28, 0, 1);
+      }
+      let temp = Math.pow(e.intensity, 0.7);
+      temp = Math.max(temp, 1 - clamp(age / 5, 0, 1), waveWarm * 0.8);
+      const [cr, cg, cb] = heat(temp);
+      const lk = isSel ? lerp(lightK, 1, selW) : lightK;
+      const nearFade = isSel ? 1 : clamp((dLoc - 0.05) / 0.15, 0, 1);
+      const alpha = Math.min(1, 0.92 * facing * nearFade);
+      const op = lerp(0.15, 1, ease(clamp(age / 0.7, 0, 1)));
+
+      // blink: own rhythm, the wave, or a tapped wave
+      const shut = age < 0.15 || pmod(t + e.blinkOff, e.blinkInt) < 0.14 || (t >= e.forced && t < e.forced + 0.14) || waveHit;
+      e.base.visible = !shut; e.closed.visible = shut;
+      const setCol = (m, k, a) => { m.color.setRGB(cr / 255 * k, cg / 255 * k, cb / 255 * k); m.opacity = a; };
+      setCol(e.mBase, lk, isSel ? 1 : alpha); setCol(e.mClosed, lk, isSel ? 1 : alpha);
+      e.base.scale.y = op;
+      e.backs.forEach((b, k) => { b.visible = !shut; b.scale.y = op; setCol(b.material, lk * (k ? 0.6 : 0.3), alpha * 0.9); });
+
+      // the iris: looks the rest of the way, then glances about in its own time
+      let aimX = clamp((ex * vT.x + ey * vT.y + ez * vT.z) * 2, -1, 1), aimY = clamp((ex * vU.x + ey * vU.y + ez * vU.z) * 2, -1, 1);
+      const gph = pmod(t + e.seed, e.glanceCycle);
+      if (gph < e.glanceLen && !isSel) { aimX = 0.9 * Math.sin(TAU * 0.5 * gph); aimY = 0.3 * Math.sin(TAU * 0.9 * gph); }
+      e.gx += (aimX - e.gx) * 0.2; e.gy += (aimY - e.gy) * 0.2;
+      e.irises.forEach((m, k) => {
+        m.visible = !shut;
+        const sk = 1 - 0.09 * k, lean = 0.006 * k;
+        m.position.set(-0.0163 + e.gx * 75 / 1810 + e.gx * lean, e.gy * 70 / 1810 * op + e.gy * lean, 0.02 + 0.014 * k);
+        m.scale.set(sk, sk * op, 1);
+        setCol(e.mIris[k], k ? Math.min(1, 0.75 + 0.07 * k) : lk, isSel ? 1 : alpha);
+      });
+      if (e.big) {
+        const llx = Lx * vT.x + Ly * vT.y + Lz * vT.z, lly = Lx * vU.x + Ly * vU.y + Lz * vU.z, llz = Lx * vN.x + Ly * vN.y + Lz * vN.z;
+        e.glint.visible = !shut;
+        e.glint.position.set(-0.0163 + e.gx * 75 / 1810 + llx * 0.03, e.gy * 70 / 1810 * op + lly * 0.03, 0.09);
+        e.glint.scale.set(0.045, 0.034, 1);
+        e.glint.material.opacity = clamp((40 + 190 * Math.max(0, llz)) / 255 * facing * nearFade, 0, 1);
+      }
+
+      // where is this eye on the screen? (for tapping)
+      tmp.set(ppx, ppy, ppz); world.localToWorld(tmp);
+      tmp.project(camera);
+      if (tmp.z < 1 && tmp.z > -1 && facing > 0.35 && age > 0.6) {
+        const projW = scale * WS * focal / Math.max(e.dWorld, 1e-4);
+        e.scr = { x: (tmp.x * 0.5 + 0.5) * innerWidth, y: (-tmp.y * 0.5 + 0.5) * innerHeight, r: Math.max(18, 0.42 * projW) + 10 };
+      } else e.scr = null;
+
+      // threads from watching eyes to the tapped eye
+      if (selEye && selW > 0.05 && !isSel && facing > 0.5 && nb < eyes.length) {
+        beamPos.set([ppx, ppy, ppz, selEye.g.position.x, selEye.g.position.y, selEye.g.position.z], nb * 6); nb++;
+      }
+    }
+    beamGeo.setDrawRange(0, nb * 2); beamGeo.attributes.position.needsUpdate = true;
+    beams.material.opacity = 0.12 * selW;
+
+    // orbit lines grow with the planet
+    for (const r of rings.values()) { r.line.scale.setScalar(r.rr * Rs); r.line.material.opacity = 0.07 * ease(clamp((t - r.bt) / 2, 0, 1)); }
+    dust.rotation.y = 0.02 * t;
+
+    // the heart faces the viewer, beats, blinks slowly
+    const hb = ease(clamp((t - 1.5) / 2, 0, 1)), beat = Math.exp(-((now % 0.48) / 0.48) * 7);
+    heart.visible = hb > 0;
+    tmp.copy(camW); heart.parent.updateWorldMatrix(true, false);
+    heart.lookAt(tmp);
+    const hw = 0.95 * Rs * hb * (1 + 0.02 * beat);
+    hBase.scale.set(hw, hw, 1); hClosed.scale.set(hw, hw, 1); hIris.scale.set(hw, hw, 1);
+    hIris.position.set(hw * (-0.0163 + 0.5 * Math.sin(0.31 * t) * 75 / 1810), hw * (0.35 * Math.sin(0.23 * t + 1) * 70 / 1810), 0.003);
+    const hShut = pmod(t, 11) < 0.28;
+    hBase.visible = hIris.visible = !hShut; hClosed.visible = hShut;
+    [hBase, hClosed, hIris].forEach(m => { m.material.color.setRGB(1, 0.92, 0.82); m.material.opacity = 0.42; });
+    halo.scale.set(hw * 1.3, hw * 1.3, 1);
+    halo.material.opacity = 0.7 + 0.3 * beat;
+
+    renderer.render(scene, camera);
+  }
+
+  if (PREVIEW) renderer.setAnimationLoop(frame);
+  else { await mindar.start(); renderer.setAnimationLoop(frame); }
+}
+</script>
+</body>
+</html>

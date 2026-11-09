@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QR code maker</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 520px; margin: 40px auto; padding: 0 20px; }
+  input { width: 100%; padding: 12px; font-size: 16px; box-sizing: border-box; margin: 8px 0 16px; }
+  button { font-size: 16px; padding: 10px 18px; margin-right: 8px; }
+  #qr { margin: 24px 0; padding: 16px; background: #fff; display: inline-block; }
+  small { color: #555; }
+</style>
+</head>
+<body>
+<h2>QR code maker</h2>
+<p>Paste the full web address of your live page (the one you tested on your phone), then press Make.</p>
+<input id="url" placeholder="https://yourname.github.io/panopticon/">
+<button id="make">Make QR code</button><button id="save">Download PNG</button>
+<div id="qr"></div>
+<p><small>Uses high error correction so it still scans if the print gets scuffed. Print it at least 4 cm wide with a clear white border, and test it with an iPhone and an Android phone before you print a lot of copies.</small></p>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<script>
+  let qr = null;
+  document.getElementById('make').onclick = () => {
+    const text = document.getElementById('url').value.trim();
+    if (!text) return;
+    const box = document.getElementById('qr');
+    box.innerHTML = '';
+    qr = new QRCode(box, { text: text, width: 512, height: 512, colorDark: '#000000', colorLight: '#ffffff', correctLevel: QRCode.CorrectLevel.H });
+  };
+  document.getElementById('save').onclick = () => {
+    const c = document.querySelector('#qr canvas');
+    if (!c) return;
+    const a = document.createElement('a');
+    a.download = 'panopticon_qr.png';
+    a.href = c.toDataURL('image/png');
+    a.click();
+  };
+</script>
+</body>
+</html>
